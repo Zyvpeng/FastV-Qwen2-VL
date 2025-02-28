@@ -11,7 +11,7 @@ model = Qwen2VLForConditionalGeneration.from_pretrained(
 processor = AutoProcessor.from_pretrained("./qwen-vl2-2b", torch_dtype=torch.float16)
 
 # Prepare the image input
-image_path = "E:/VLM-Compress/HFT-learn/demo.jpeg"
+image_path = "./img.png"
 messages = [
     {
         "role": "user",
@@ -22,7 +22,7 @@ messages = [
                 "resized_height": 560,
                 "resized_width": 560,
             },
-            {"type": "text", "text": "Describe this image."},
+            {"type": "text", "text": "the image shows a python code. Is the output of the code is what?"},
         ],
     }
 ]

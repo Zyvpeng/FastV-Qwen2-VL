@@ -565,6 +565,7 @@ class Qwen2VLAttention(nn.Module):
             cos, sin = self.rotary_emb(value_states, position_ids)
         else:
             cos, sin = position_embeddings
+
         query_states, key_states = apply_multimodal_rotary_pos_emb(
             query_states, key_states, cos, sin, self.rope_scaling["mrope_section"]
         )
@@ -576,8 +577,7 @@ class Qwen2VLAttention(nn.Module):
             key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
         #测试，只删除第一层的第一个key和value cache
         #后面27层的key，value都不变
-        print(len(past_key_value.key_cache))
-        print(past_key_value.key_cache[0].shape)
+
         # if len(past_key_value.key_cache)>1:
         #     print(print(past_key_value.key_cache[1].shape))
         # if len(past_key_value.key_cache)==1:
@@ -607,7 +607,7 @@ class Qwen2VLAttention(nn.Module):
         # upcast attention to fp32
         attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
         attn_weights = nn.functional.dropout(attn_weights, p=self.attention_dropout, training=self.training)
-        print(attn_weights.shape)
+        # print(attn_weights.shape)
         attn_output = torch.matmul(attn_weights, value_states)
 
         if attn_output.size() != (bsz, self.num_heads, q_len, self.head_dim):
@@ -933,8 +933,7 @@ class Qwen2VLDecoderLayer(nn.Module):
             cache_position=cache_position,
             position_embeddings=position_embeddings,
         )
-        print("attn")
-        print(self_attn_weights.shape)
+
         hidden_states = residual + hidden_states
 
         # Fully Connected
@@ -1115,6 +1114,9 @@ class Qwen2VLModel(Qwen2VLPreTrainedModel):
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
+        img_start = None,
+        img_end = None,
+        input_len = None,
     ) -> Union[Tuple, BaseModelOutputWithPast]:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
@@ -1148,7 +1150,7 @@ class Qwen2VLModel(Qwen2VLPreTrainedModel):
             position_ids = cache_position.view(1, 1, -1).expand(3, inputs_embeds.shape[0], -1)
         elif position_ids.dim() == 2:
             position_ids = position_ids[None, ...].expand(3, position_ids.shape[0], -1)
-        print(11)
+
         causal_mask = self._update_causal_mask(
             attention_mask, inputs_embeds, cache_position, past_key_values, output_attentions
         )
@@ -1164,8 +1166,17 @@ class Qwen2VLModel(Qwen2VLPreTrainedModel):
         next_decoder_cache = None
 
         for decoder_layer in self.layers:
+            # print("len hidden")
+            # print(len(hidden_states))
+            # print(hidden_states[0].shape)
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
+            # print("aaaaaaaaa")
+            # print(hidden_states[0].shape)
+            # print(causal_mask.shape)
+            # # print(position_ids.shape)
+            # print(position_embeddings[0].shape)
+            # print(position_embeddings[1].shape)
 
             if self.gradient_checkpointing and self.training:
                 layer_outputs = self._gradient_checkpointing_func(
@@ -1198,36 +1209,37 @@ class Qwen2VLModel(Qwen2VLPreTrainedModel):
 
             if output_attentions:
                 all_self_attns += (layer_outputs[1],)
-                print("-----------")
-                print(len(all_self_attns))
-                if len(all_self_attns)==28 and all_self_attns[0].size(2)==425 and self.dropf==False:
+                if len(all_self_attns)==2 and all_self_attns[0].size(2)==input_len and self.dropf==False:
+                    print("drop")
                     self.dropf = True
                     rank_score = torch.sum(all_self_attns[1],dim=1).squeeze(0)
                     rank_score = torch.sum(rank_score,dim=0)
-                    div_vector = torch.range(1,425,1,device='cuda').flip(dims=[0])
+                    div_vector = torch.range(1,input_len,1,device='cuda').flip(dims=[0])
                     rank_score = rank_score/div_vector
-                    values, index = torch.topk(rank_score,300,largest=False)
+                    #截取图像部分的attention score
+                    img_rank_score = rank_score[img_start:img_end+1]
+                    values, index = torch.topk(img_rank_score,300,largest=False)
 
-                    all_index = torch.arange(425,device='cuda')
-                    mask = ~torch.isin(all_index,index)
+                    all_index = torch.arange(rank_score.size(0),device='cuda')
+                    mask = ~torch.isin(all_index,index+img_start)
                     retained_index = all_index[mask]
 
+                    hidden_states = torch.index_select(hidden_states,dim=1,index=retained_index)
+                    causal_mask = torch.index_select(causal_mask,dim=2,index=retained_index)
+                    causal_mask = torch.index_select(causal_mask,dim=3,index=retained_index)
+                    position_embeddings = list(position_embeddings)
+                    position_embeddings[0] = torch.index_select(position_embeddings[0],dim=2,index=retained_index)
+                    position_embeddings[1] = torch.index_select(position_embeddings[1],dim=2,index=retained_index)
+                    position_embeddings = tuple(position_embeddings)
+                    # print(retained_index)
                     for i,_ in enumerate(next_decoder_cache.key_cache):
-                        if i>2:
+                        if i>1:
                             next_decoder_cache.key_cache[i] = torch.index_select(_,dim=2,index=retained_index)
 
                     for i,_ in enumerate(next_decoder_cache.value_cache):
-                        if i> 2:
+                        if i> 1:
                             next_decoder_cache.value_cache[i] = torch.index_select(_,dim=2,index=retained_index)
-
-                # print(index)
-                # print(div_vector)
-                # print(rank_score.shape)
-                # print(all_self_attns[0])
-                # print(all_self_attns[0].shape)
-                # print(len(next_decoder_cache.key_cache))
-                # print(next_decoder_cache.key_cache[0].shape)
-                print("-----------")
+                    past_key_values = next_decoder_cache
 
         hidden_states = self.norm(hidden_states)
 
@@ -1733,7 +1745,8 @@ class Qwen2VLForConditionalGeneration(Qwen2VLPreTrainedModel, GenerationMixin):
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
-
+        img_start = -100
+        img_end = -100
         if inputs_embeds is None:
             inputs_embeds = self.model.embed_tokens(input_ids)
             if pixel_values is not None:
@@ -1741,12 +1754,7 @@ class Qwen2VLForConditionalGeneration(Qwen2VLPreTrainedModel, GenerationMixin):
                 image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw)
                 n_image_tokens = (input_ids == self.config.image_token_id).sum().item()
                 n_image_features = image_embeds.shape[0]
-                # print("123123")
-                # print(pixel_values.shape)
-                # print(image_embeds.shape)
-                # print(n_image_tokens)
-                # print(n_image_features)
-                # print(n_image_tokens) #查看visual tokens的数量
+
                 if n_image_tokens != n_image_features:
                     raise ValueError(
                         f"Image features and image tokens do not match: tokens: {n_image_tokens}, features {n_image_features}"
@@ -1757,6 +1765,11 @@ class Qwen2VLForConditionalGeneration(Qwen2VLPreTrainedModel, GenerationMixin):
                     .expand_as(inputs_embeds)
                     .to(inputs_embeds.device)
                 )
+                #torch.nonzero:返回所有非零元素的下标
+                img_index = torch.nonzero(input_ids.squeeze()==self.config.image_token_id).squeeze()
+                img_start = img_index[0]  #图像开始的下标
+                img_end = img_index[-1]     #图像结束的下标
+
                 # print(self.config.image_token_id)
                 # im_start = 0
                 # for i in range(0,image_mask.shape[1]):
@@ -1810,9 +1823,10 @@ class Qwen2VLForConditionalGeneration(Qwen2VLPreTrainedModel, GenerationMixin):
             if attention_mask is not None:
                 attention_mask = attention_mask.to(inputs_embeds.device)
 
-        # print(inputs_embeds.shape)
-        # print(attention_mask.shape)
-        # print(output_hidden_states)
+        if input_ids is not None:
+            input_len = input_ids.size(-1)
+        else:
+            input_len = -100 #
         outputs = self.model(
             input_ids=None,
             position_ids=position_ids,
@@ -1823,6 +1837,9 @@ class Qwen2VLForConditionalGeneration(Qwen2VLPreTrainedModel, GenerationMixin):
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
+            img_start= img_start,
+            img_end = img_end,
+            input_len = input_len
         )
 
         hidden_states = outputs[0]
