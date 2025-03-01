@@ -878,6 +878,7 @@ class Qwen2VLDecoderLayer(nn.Module):
                 f"Sliding Window Attention is enabled but not implemented for `{config._attn_implementation}`; "
                 "unexpected results may be encountered."
             )
+        # print(config._attn_implementation)
         self.self_attn = QWEN2_VL_ATTENTION_CLASSES[config._attn_implementation](config, layer_idx)
 
         self.mlp = Qwen2MLP(config)
@@ -1117,6 +1118,8 @@ class Qwen2VLModel(Qwen2VLPreTrainedModel):
         img_start = None,
         img_end = None,
         input_len = None,
+        start_layer = None,
+        drop_token_nums = None,
     ) -> Union[Tuple, BaseModelOutputWithPast]:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
@@ -1209,16 +1212,16 @@ class Qwen2VLModel(Qwen2VLPreTrainedModel):
 
             if output_attentions:
                 all_self_attns += (layer_outputs[1],)
-                if len(all_self_attns)==2 and all_self_attns[0].size(2)==input_len and self.dropf==False:
-                    print("drop")
+                if len(all_self_attns)==start_layer and all_self_attns[0].size(2)==input_len and self.dropf==False:
+                    print("dropping tokens.........")
                     self.dropf = True
-                    rank_score = torch.sum(all_self_attns[1],dim=1).squeeze(0)
+                    rank_score = torch.sum(all_self_attns[start_layer-1],dim=1).squeeze(0)
                     rank_score = torch.sum(rank_score,dim=0)
                     div_vector = torch.range(1,input_len,1,device='cuda').flip(dims=[0])
                     rank_score = rank_score/div_vector
                     #截取图像部分的attention score
                     img_rank_score = rank_score[img_start:img_end+1]
-                    values, index = torch.topk(img_rank_score,300,largest=False)
+                    values, index = torch.topk(img_rank_score,drop_token_nums,largest=False)
 
                     all_index = torch.arange(rank_score.size(0),device='cuda')
                     mask = ~torch.isin(all_index,index+img_start)
@@ -1232,12 +1235,13 @@ class Qwen2VLModel(Qwen2VLPreTrainedModel):
                     position_embeddings[1] = torch.index_select(position_embeddings[1],dim=2,index=retained_index)
                     position_embeddings = tuple(position_embeddings)
                     # print(retained_index)
+                    #这两个for训练貌似不是必要的，因为调整完hiddenstates后，下一层的kv cache会自动调整大小
                     for i,_ in enumerate(next_decoder_cache.key_cache):
-                        if i>1:
+                        if i>=start_layer:
                             next_decoder_cache.key_cache[i] = torch.index_select(_,dim=2,index=retained_index)
 
                     for i,_ in enumerate(next_decoder_cache.value_cache):
-                        if i> 1:
+                        if i>=start_layer:
                             next_decoder_cache.value_cache[i] = torch.index_select(_,dim=2,index=retained_index)
                     past_key_values = next_decoder_cache
 
@@ -1483,6 +1487,7 @@ class Qwen2VLForConditionalGeneration(Qwen2VLPreTrainedModel, GenerationMixin):
     _tied_weights_keys = ["lm_head.weight"]
 
     def __init__(self, config):
+        # print(config)
         super().__init__(config)
         self.X = 0
         self.visual = Qwen2VisionTransformerPretrainedModel._from_config(config.vision_config)
@@ -1493,6 +1498,10 @@ class Qwen2VLForConditionalGeneration(Qwen2VLPreTrainedModel, GenerationMixin):
 
         # Initialize weights and apply final processing
         self.post_init()
+
+    def set_drop_config(self,drop_nums=300,start_layer=2):
+        self.drop_token_nums = drop_nums
+        self.start_layer = start_layer
 
     def get_input_embeddings(self):
         return self.model.embed_tokens
@@ -1839,7 +1848,9 @@ class Qwen2VLForConditionalGeneration(Qwen2VLPreTrainedModel, GenerationMixin):
             return_dict=return_dict,
             img_start= img_start,
             img_end = img_end,
-            input_len = input_len
+            input_len = input_len,
+            drop_token_nums = self.drop_token_nums,
+            start_layer = self.start_layer
         )
 
         hidden_states = outputs[0]

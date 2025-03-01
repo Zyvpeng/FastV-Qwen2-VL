@@ -7,6 +7,7 @@ model = Qwen2VLForConditionalGeneration.from_pretrained(
     "./qwen-vl2-2b", torch_dtype="auto", device_map="auto"
 )
 
+model.set_drop_config(100,2)
 # Load the processor
 processor = AutoProcessor.from_pretrained("./qwen-vl2-2b", torch_dtype=torch.float16)
 
